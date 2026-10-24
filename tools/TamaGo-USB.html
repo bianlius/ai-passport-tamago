@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tama-Go USB 有线传输</title>
+  <style>
+    :root{color-scheme:dark;font-family:system-ui,-apple-system,"PingFang SC",sans-serif}
+    *{box-sizing:border-box}body{margin:0;background:#17212b;color:#e6eddb}
+    main{max-width:640px;margin:auto;padding:24px 18px 48px}
+    h1{font-size:26px;margin:0 0 8px;color:#f2d376}p{line-height:1.55;color:#b9cbbf}
+    .note{background:#25343d;border:1px solid #51645d;border-radius:12px;padding:12px 14px;margin:16px 0}
+    .item{background:#223039;border:1px solid #506159;border-radius:12px;padding:14px;margin:11px 0}
+    .head{display:flex;justify-content:space-between;gap:8px;align-items:center}
+    .name{font-weight:650}.state{font-size:13px;color:#aec1ae}.size{font-size:13px;color:#91a69e;margin:5px 0 10px}
+    .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    input[type=file]{max-width:100%;font-size:13px}button{border:0;border-radius:8px;padding:9px 15px;background:#f2d376;color:#17212b;font-weight:700;cursor:pointer}
+    button:disabled{opacity:.45;cursor:default}progress{width:100%;height:9px;margin-top:10px;display:none}
+    #message{min-height:22px;color:#f2d376}#finish{margin-top:15px;width:100%;font-size:16px}
+    .bad{color:#ff9a91!important}.good{color:#9fe2b7!important}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Tama-Go USB 有线传输</h1>
+  <p>用 USB 数据线连接 AI Passport，在设备上选择“USB 有线传输”，然后点击“连接设备”。人物配件可一次选择多个文件，网页会按 ROM 内部编号自动识别。</p>
+  <div class="note">有线传输需要浏览器支持 Web Serial，推荐电脑上的 Chrome 或 Edge。请在浏览器的串口列表中选择当前连接的 AI Passport；串口名称和 USB 编号可能因设备而异。连接后网页会验证传输协议。本页在电脑本地运行，文件不会上传到互联网。</div>
+  <div class="controls"><button id="connect" type="button">连接设备</button><button id="disconnect" type="button" disabled>断开连接</button></div>
+  <p id="message" role="status">尚未连接设备</p>
+  <section class="item" aria-label="宠物存档">
+    <div class="name">宠物存档</div>
+    <p>可导出备份；导入前建议先下载现有存档。存档与主游戏 ROM 必须匹配。</p>
+    <div class="controls">
+      <button id="save-export" type="button" disabled>导出存档</button>
+      <input id="save-file" type="file" accept=".tgsave,application/octet-stream" aria-label="选择存档文件">
+      <button id="save-import" type="button" disabled>导入存档</button>
+    </div>
+  </section>
+  <div id="slots"></div>
+  <section class="item" aria-label="人物配件 ROM">
+    <div class="head"><span class="name">人物配件 ROM</span><span class="state" id="figure-state">已导入 0/12</span></div>
+    <p>选择一个或多个 .bin 文件；无需指定角色，未知文件不会上传。</p>
+    <div class="controls">
+      <input id="figure-files" type="file" multiple accept=".bin,application/octet-stream" aria-label="选择人物配件 ROM">
+      <button id="figure-upload" type="button" disabled>导入配件</button>
+    </div>
+    <div class="size" id="figure-preview">尚未选择配件文件</div>
+    <div class="size" id="figure-list">尚未导入人物配件</div>
+    <progress id="figure-progress" max="100"></progress>
+  </section>
+  <button id="finish" type="button" disabled>完成并启动游戏</button>
+</main>
+<script>
+'use strict';
+const names=['游戏 ROM','麻每吉 Mametchi','美眉吉 Memetchi','咕叽叭吉 Kuchipatchi','美眉麻每吉 Chamametchi','紫罗兰吉 Violetchi','苹果吉 Ringotchi','黑黑麻每吉 Kuromametchi','背鳍吉 Sebiretchi','小马吉 Ponytchi','草莓吉 Ichigotchi','条纹吉 Shimashimatchi','麻纪子 Makiko'];
+const sizes=[655360,349536,349536,349536,349536,349536,349536,524288,524288,524288,524288,524288,524288];
+const SAVE_MIN=4124, SAVE_MAX=8220, CHUNK=1024;
+const encoder=new TextEncoder(), decoder=new TextDecoder('ascii');
+const cards=[], message=document.getElementById('message');
+const figureReady=Array(12).fill(false);
+let link=null, busy=false;
+function say(value,bad=false){message.textContent=value;message.className=bad?'bad':'good'}
+function controls(){
+  const ready=!!link&&!link.closed;
+  document.getElementById('connect').disabled=busy||ready;
+  document.getElementById('disconnect').disabled=busy||!ready;
+  for(const id of ['save-export','save-import','finish'])document.getElementById(id).disabled=busy||!ready;
+  for(const card of cards)card.button.disabled=busy||!ready;
+  document.getElementById('figure-upload').disabled=busy||!ready;
+}
+function renderFigures(){
+  const imported=names.slice(1).filter((_,i)=>figureReady[i]);
+  document.getElementById('figure-state').textContent='已导入 '+imported.length+'/12';
+  document.getElementById('figure-list').textContent=imported.length?imported.join('、'):'尚未导入人物配件';
+}
+async function selectedFigures(){
+  const files=Array.from(document.getElementById('figure-files').files||[]);
+  if(!files.length)throw new Error('请先选择人物配件 ROM');
+  const seen=new Set(),entries=[];
+  for(const file of files){
+    const header=new Uint8Array(await file.slice(0,22).arrayBuffer());
+    const slot=header[20]-2;
+    if(header.length<22||header[1]!==0xaa||header[2]!==0x55||
+       header[17]!==0xaa||header[18]!==0x55||header[19]!==3||
+       header[21]!==3||slot<1||slot>12||
+       header[3]!== (slot<=6?8:4)||file.size!==sizes[slot])
+      throw new Error(file.name+'：未识别出支持的人物配件 ROM');
+    if(seen.has(slot))throw new Error('重复选择了 '+names[slot]+' 的配件文件');
+    seen.add(slot);entries.push({file,slot});
+  }
+  return entries;
+}
+document.getElementById('figure-files').onchange=async()=>{
+  try{
+    const entries=await selectedFigures();
+    document.getElementById('figure-preview').textContent='已识别：'+entries.map(e=>names[e.slot]).join('、');
+  }catch(error){document.getElementById('figure-preview').textContent=error.message}
+};
+function timeoutMessage(){return new Error('设备无响应；请确认屏幕处于 USB 有线传输界面，并保持数据线连接')}
+
+class SerialLink{
+  constructor(port){this.port=port;this.queue=[];this.offset=0;this.waiter=null;this.closed=false;this.error=null}
+  async open(){
+    await this.port.open({baudRate:115200,bufferSize:4096});
+    this.reader=this.port.readable.getReader();
+    this.writer=this.port.writable.getWriter();
+    this.pumpTask=this.pump();
+  }
+  wake(){if(this.waiter){const wake=this.waiter;this.waiter=null;wake()}}
+  async pump(){
+    try{
+      while(true){
+        const {value,done}=await this.reader.read();
+        if(done)break;
+        if(value&&value.length){this.queue.push(value);this.wake()}
+      }
+    }catch(error){this.error=error}
+    finally{this.closed=true;this.wake();this.reader.releaseLock()}
+  }
+  async waitForBytes(deadline){
+    if(this.queue.length)return;
+    if(this.closed)throw this.error||new Error('USB 连接已断开');
+    const remaining=deadline-Date.now();
+    if(remaining<=0)throw timeoutMessage();
+    await new Promise((resolve,reject)=>{
+      const timer=setTimeout(()=>{this.waiter=null;reject(timeoutMessage())},remaining);
+      this.waiter=()=>{clearTimeout(timer);resolve()};
+    });
+  }
+  async readBytes(count,timeout=20000){
+    const result=new Uint8Array(count),deadline=Date.now()+timeout;
+    let used=0;
+    while(used<count){
+      await this.waitForBytes(deadline);
+      const part=this.queue[0],take=Math.min(count-used,part.length-this.offset);
+      result.set(part.subarray(this.offset,this.offset+take),used);
+      used+=take;this.offset+=take;
+      if(this.offset===part.length){this.queue.shift();this.offset=0}
+    }
+    return result;
+  }
+  async readLine(timeout=20000){
+    const deadline=Date.now()+timeout,bytes=[];
+    while(bytes.length<128){
+      const one=await this.readBytes(1,Math.max(1,deadline-Date.now()));
+      if(one[0]===10){
+        const line=decoder.decode(new Uint8Array(bytes)).trim();
+        if(line.startsWith('TG1 ERR '))throw new Error('设备拒绝操作：'+line.slice(8));
+        if(line.startsWith('TG1 '))return line;
+        bytes.length=0; // USB 启动日志不是协议回复。
+      }else bytes.push(one[0]);
+    }
+    throw new Error('设备回复过长');
+  }
+  async sendLine(line){await this.writer.write(encoder.encode(line+'\n'))}
+  async command(line,expected,timeout=20000){
+    await this.sendLine(line);
+    const reply=await this.readLine(timeout);
+    if(!reply.startsWith(expected))throw new Error('设备回复异常：'+reply);
+    return reply;
+  }
+  async connect(){
+    const deadline=Date.now()+18000;
+    while(Date.now()<deadline){
+      try{
+        const reply=await this.command('TG1 HELLO','TG1 READY ',1500);
+        return this.parseMask(reply);
+      }catch(error){
+        if(this.closed)throw error;
+        await new Promise(resolve=>setTimeout(resolve,400));
+      }
+    }
+    throw new Error('未收到 Tama-Go 传输回应；请确认选中了 AI Passport 串口，并在设备上选择 USB 有线传输');
+  }
+  parseMask(reply){
+    const match=/^TG1 READY ([0-9A-Fa-f]{1,4})$/.exec(reply);
+    if(!match)throw new Error('设备状态格式错误');
+    return parseInt(match[1],16);
+  }
+  async status(){return this.parseMask(await this.command('TG1 HELLO','TG1 READY '))}
+  async upload(slot,data,onProgress){
+    await this.command(`TG1 BEGIN ${slot} ${data.length}`,'TG1 OK BEGIN',30000);
+    for(let written=0;written<data.length;){
+      const chunk=data.subarray(written,written+CHUNK);
+      await this.sendLine(`TG1 DATA ${chunk.length}`);
+      await this.writer.write(chunk);
+      written+=chunk.length;
+      const reply=await this.readLine();
+      if(reply!==`TG1 ACK ${written}`)throw new Error('写入进度异常：'+reply);
+      onProgress(written/data.length);
+    }
+    await this.command('TG1 END','TG1 OK END',30000);
+  }
+  async exportSave(){
+    const header=await this.command('TG1 SAVE GET','TG1 SAVE ');
+    const match=/^TG1 SAVE (\d+)$/.exec(header),size=match&&Number(match[1]);
+    if(!size||size<SAVE_MIN||size>SAVE_MAX)throw new Error('存档长度不合理');
+    const data=await this.readBytes(size);
+    const reply=await this.readLine();
+    if(reply!=='TG1 OK SAVE')throw new Error('存档下载未完成：'+reply);
+    validateSave(data);
+    return data;
+  }
+  async importSave(data,onProgress){
+    validateSave(data);
+    await this.command(`TG1 SAVE BEGIN ${data.length}`,'TG1 OK BEGIN');
+    for(let written=0;written<data.length;){
+      const chunk=data.subarray(written,written+CHUNK);
+      await this.sendLine(`TG1 DATA ${chunk.length}`);
+      await this.writer.write(chunk);
+      written+=chunk.length;
+      const reply=await this.readLine();
+      if(reply!==`TG1 ACK ${written}`)throw new Error('存档写入进度异常：'+reply);
+      onProgress(written/data.length);
+    }
+    await this.command('TG1 END','TG1 OK END');
+  }
+  async finish(){await this.command('TG1 FINISH','TG1 OK FINISH')}
+  async close(){
+    if(!this.closed)await this.reader.cancel();
+    await this.pumpTask;
+    this.writer.releaseLock();
+    await this.port.close();
+  }
+}
+
+const crcTable=new Uint32Array(256);
+for(let i=0;i<256;i++){
+  let value=i;
+  for(let bit=0;bit<8;bit++)value=value&1?0xEDB88320^(value>>>1):value>>>1;
+  crcTable[i]=value>>>0;
+}
+function validateSave(data){
+  if(data.length<SAVE_MIN||data.length>SAVE_MAX)throw new Error('存档文件大小不符');
+  const view=new DataView(data.buffer,data.byteOffset,data.byteLength);
+  if(decoder.decode(data.subarray(0,4))!=='TGSV'||view.getUint16(4,true)!==1||
+     view.getUint16(6,true)!==0||view.getUint32(8,true)!==data.length||
+     view.getUint32(12,true)===0||view.getUint32(16,true)!==data.length-SAVE_MIN||
+     view.getUint16(22,true)!==0)throw new Error('存档损坏或版本不支持');
+  let crc=0xFFFFFFFF;
+  for(let i=0;i<data.length;i++){
+    const byte=i>=24&&i<28?0:data[i];
+    crc=crcTable[(crc^byte)&255]^(crc>>>8);
+  }
+  if((crc^0xFFFFFFFF)>>>0!==view.getUint32(24,true))throw new Error('存档 CRC 校验失败');
+}
+async function perform(action){
+  if(!link||link.closed){say('请先连接设备',true);controls();return}
+  busy=true;controls();
+  try{await action()}
+  catch(error){say(error.message||String(error),true);if(!link||link.closed)link=null}
+  finally{busy=false;controls()}
+}
+function refresh(mask){
+  const ready=!!(mask&1);
+  cards[0].state.textContent=ready?'已导入':'未导入';
+  cards[0].state.className=ready?'state good':'state';
+  figureReady.forEach((_,i)=>{figureReady[i]=!!(mask&(1<<(i+1)))});
+  renderFigures();
+}
+
+for(let i=0;i<1;i++){
+  const card=document.createElement('section');card.className='item';
+  const head=document.createElement('div');head.className='head';
+  const name=document.createElement('span');name.className='name';
+  name.textContent=(i===0?'主游戏':'配件 '+i)+' · '+names[i];
+  const state=document.createElement('span');state.className='state';state.textContent='未连接';
+  head.append(name,state);
+  const size=document.createElement('div');size.className='size';
+  size.textContent='需要 '+(sizes[i]/1024).toFixed(1)+' KiB 的 .bin 文件';
+  const controlsEl=document.createElement('div');controlsEl.className='controls';
+  const input=document.createElement('input');input.type='file';input.accept='.bin,application/octet-stream';
+  input.setAttribute('aria-label','选择 '+names[i]+' 文件');
+  const button=document.createElement('button');button.type='button';button.textContent='导入';button.disabled=true;
+  const bar=document.createElement('progress');bar.max=100;
+  controlsEl.append(input,button);card.append(head,size,controlsEl,bar);
+  document.getElementById('slots').append(card);cards.push({state,input,button,bar});
+  button.onclick=()=>perform(async()=>{
+    const file=input.files&&input.files[0];
+    if(!file)throw new Error('请先选择文件');
+    if(file.size!==sizes[i])throw new Error(names[i]+' 文件大小不符，应为 '+sizes[i]+' 字节');
+    const data=new Uint8Array(await file.arrayBuffer());
+    bar.style.display='block';bar.value=0;state.textContent='传输中';say('正在导入 '+names[i]);
+    try{
+      await link.upload(i,data,progress=>{bar.value=Math.round(progress*100)});
+      state.textContent='已导入';state.className='state good';say(names[i]+' 导入成功');
+    }catch(error){state.textContent='导入失败';state.className='state bad';throw error}
+    finally{bar.style.display='none'}
+  });
+}
+document.getElementById('figure-upload').onclick=()=>perform(async()=>{
+  const entries=await selectedFigures();
+  const bar=document.getElementById('figure-progress');bar.style.display='block';bar.value=0;
+  try{
+    for(let index=0;index<entries.length;index++){
+      const {file,slot}=entries[index];say('正在导入 '+names[slot]);
+      const data=new Uint8Array(await file.arrayBuffer());
+      await link.upload(slot,data,progress=>{
+        bar.value=Math.round((index+progress)/entries.length*100);
+      });
+      figureReady[slot-1]=true;renderFigures();bar.value=Math.round((index+1)/entries.length*100);
+    }
+    say('已导入 '+entries.map(e=>names[e.slot]).join('、'));
+  }finally{bar.style.display='none'}
+});
+
+document.getElementById('connect').onclick=async()=>{
+  if(!navigator.serial||!window.isSecureContext){
+    say('当前浏览器不支持 Web Serial；请用电脑上的 Chrome 或 Edge 打开此 HTML 文件',true);return;
+  }
+  let port;
+  // Some macOS Chromium builds omit native CDC ports when a USB ID filter is
+  // supplied. The TG1 HELLO handshake identifies the device after selection.
+  try{port=await navigator.serial.requestPort()}
+  catch(error){if(error.name!=='NotFoundError')say('无法选择设备：'+error.message,true);return}
+  busy=true;controls();
+  try{
+    link=new SerialLink(port);await link.open();
+    say('正在等待设备进入 USB 传输模式…');
+    refresh(await link.connect());
+    say('已连接 AI Passport，可以导入 ROM 或管理存档');
+  }catch(error){
+    say(error.message||String(error),true);
+    if(link){try{await link.close()}catch{}link=null}
+  }finally{busy=false;controls()}
+};
+document.getElementById('disconnect').onclick=()=>perform(async()=>{
+  await link.close();link=null;say('已断开连接');
+});
+document.getElementById('save-export').onclick=()=>perform(async()=>{
+  const data=await link.exportSave();
+  const url=URL.createObjectURL(new Blob([data],{type:'application/octet-stream'}));
+  const anchor=document.createElement('a');anchor.href=url;
+  anchor.download='TamaGo-'+new Date().toISOString().slice(0,10)+'.tgsave';
+  document.body.append(anchor);anchor.click();anchor.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),30000);
+  say('存档已下载，请妥善保存');
+});
+document.getElementById('save-import').onclick=()=>perform(async()=>{
+  const file=document.getElementById('save-file').files[0];
+  if(!file)throw new Error('请先选择 .tgsave 存档');
+  const data=new Uint8Array(await file.arrayBuffer());validateSave(data);
+  if(!confirm('导入将替换设备上的宠物存档。确认继续？'))return;
+  await link.importSave(data,()=>{});
+  say('存档已导入；点击“完成并启动游戏”查看宠物');
+});
+document.getElementById('finish').onclick=()=>perform(async()=>{
+  await link.finish();say('设备正在启动游戏，可以关闭此页面');
+  link=null;
+});
+if(!navigator.serial||!window.isSecureContext)
+  say('当前浏览器不支持 Web Serial；请用电脑上的 Chrome 或 Edge 打开此 HTML 文件',true);
+if(navigator.serial)navigator.serial.addEventListener('disconnect',event=>{
+  if(link&&event.target===link.port){link=null;say('USB 设备已断开',true);controls()}
+});
+</script>
+</body>
+</html>

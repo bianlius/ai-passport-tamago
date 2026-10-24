@@ -1,0 +1,8 @@
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+main/private_rom/
+.DS_Store
+__pycache__/
+*.pyc

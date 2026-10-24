@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tama-Go 文件传输</title>
+  <style>
+    :root{color-scheme:dark;font-family:system-ui,-apple-system,"PingFang SC",sans-serif}
+    *{box-sizing:border-box}body{margin:0;background:#17212b;color:#e6eddb}
+    main{max-width:620px;margin:auto;padding:24px 18px 48px}
+    h1{font-size:26px;margin:0 0 8px;color:#f2d376}p{line-height:1.55;color:#b9cbbf}
+    .note{background:#25343d;border:1px solid #51645d;border-radius:12px;padding:12px 14px;margin:16px 0}
+    .item{background:#223039;border:1px solid #506159;border-radius:12px;padding:14px;margin:11px 0}
+    .head{display:flex;justify-content:space-between;gap:8px;align-items:center}
+    .name{font-weight:650}.state{font-size:13px;color:#aec1ae}.size{font-size:13px;color:#91a69e;margin:5px 0 10px}
+    .controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    input[type=file]{max-width:100%;font-size:13px}button{border:0;border-radius:8px;padding:9px 15px;background:#f2d376;color:#17212b;font-weight:700}
+    button:disabled{opacity:.45}progress{width:100%;height:9px;margin-top:10px;display:none}
+    #message{min-height:22px;color:#f2d376}#finish{margin-top:15px;width:100%;font-size:16px}
+    .bad{color:#ff9a91!important}.good{color:#9fe2b7!important}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Tama-Go 文件传输</h1>
+  <p>先导入 640 KiB 游戏 ROM，再按需导入人物配件 ROM。配件可一次选择多个文件，网页会根据 ROM 内部编号识别角色。文件保存在设备的独立闪存区。</p>
+  <div class="note" id="guide">无线传输可用手机或电脑上的常用浏览器。请保持连接设备热点，在浏览器访问 <strong>http://192.168.4.1/</strong>。如果自动弹出的简易联网窗口无法选择文件或下载存档，请改用 Safari、Chrome 等完整浏览器打开该地址。</div>
+  <div id="message" role="status"></div>
+  <section class="item" aria-label="宠物存档">
+    <div class="name">宠物存档</div>
+    <p>导出备份包含宠物 EEPROM 和当前会话；导入前建议先下载一份现有存档。</p>
+    <div class="controls">
+      <button id="save-export" type="button">导出存档</button>
+      <input id="save-file" type="file" accept=".tgsave,application/octet-stream" aria-label="选择存档文件">
+      <button id="save-import" type="button">导入存档</button>
+    </div>
+  </section>
+  <div id="slots"></div>
+  <section class="item" aria-label="人物配件 ROM">
+    <div class="head"><span class="name">人物配件 ROM</span><span class="state" id="figure-state">已导入 0/12</span></div>
+    <p>选择一个或多个 .bin 文件；无需指定角色，未知文件不会上传。</p>
+    <div class="controls">
+      <input id="figure-files" type="file" multiple accept=".bin,application/octet-stream" aria-label="选择人物配件 ROM">
+      <button id="figure-upload" type="button">导入配件</button>
+    </div>
+    <div class="size" id="figure-preview">尚未选择配件文件</div>
+    <div class="size" id="figure-list">尚未导入人物配件</div>
+    <progress id="figure-progress" max="100"></progress>
+  </section>
+  <button id="finish" type="button">完成并启动游戏</button>
+</main>
+<script>
+const names=['游戏 ROM','麻每吉 Mametchi','美眉吉 Memetchi','咕叽叭吉 Kuchipatchi','美眉麻每吉 Chamametchi','紫罗兰吉 Violetchi','苹果吉 Ringotchi','黑黑麻每吉 Kuromametchi','背鳍吉 Sebiretchi','小马吉 Ponytchi','草莓吉 Ichigotchi','条纹吉 Shimashimatchi','麻纪子 Makiko'];
+const sizes=[655360,349536,349536,349536,349536,349536,349536,524288,524288,524288,524288,524288,524288];
+const cards=[];
+const figureReady=Array(12).fill(false);
+const message=document.getElementById('message');
+let uploadBusy=false;
+const isUsb=location.hostname==='127.0.0.1'||location.hostname==='localhost';
+if(isUsb)
+  document.getElementById('guide').textContent='USB 有线传输：保持设备连接电脑。主游戏单独导入，配件可一次选择多个 .bin 文件；看到“导入成功”前不要拔线。';
+function say(text,bad=false){message.textContent=text;message.className=bad?'bad':'good'}
+function setUploadBusy(value){
+  uploadBusy=value;
+  if(cards.length)cards[0].button.disabled=value;
+  document.getElementById('figure-upload').disabled=value;
+  document.getElementById('finish').disabled=value;
+}
+function renderFigures(){
+  const imported=names.slice(1).filter((_,i)=>figureReady[i]);
+  document.getElementById('figure-state').textContent='已导入 '+imported.length+'/12';
+  document.getElementById('figure-list').textContent=imported.length?imported.join('、'):'尚未导入人物配件';
+}
+async function selectedFigures(){
+  const files=Array.from(document.getElementById('figure-files').files||[]);
+  if(!files.length)throw new Error('请先选择人物配件 ROM');
+  const seen=new Set(),entries=[];
+  for(const file of files){
+    const header=new Uint8Array(await file.slice(0,22).arrayBuffer());
+    const slot=header[20]-2;
+    if(header.length<22||header[1]!==0xaa||header[2]!==0x55||
+       header[17]!==0xaa||header[18]!==0x55||header[19]!==3||
+       header[21]!==3||slot<1||slot>12||
+       header[3]!== (slot<=6?8:4)||file.size!==sizes[slot])
+      throw new Error(file.name+'：未识别出支持的人物配件 ROM');
+    if(seen.has(slot))throw new Error('重复选择了 '+names[slot]+' 的配件文件');
+    seen.add(slot);entries.push({file,slot});
+  }
+  return entries;
+}
+document.getElementById('figure-files').onchange=async()=>{
+  try{
+    const entries=await selectedFigures();
+    document.getElementById('figure-preview').textContent='已识别：'+entries.map(e=>names[e.slot]).join('、');
+  }catch(error){document.getElementById('figure-preview').textContent=error.message}
+};
+document.getElementById('save-export').onclick=async()=>{
+  const button=document.getElementById('save-export');button.disabled=true;
+  try{
+    const response=await fetch('/api/save',{cache:'no-store'});
+    if(!response.ok){say(await response.text(),true);return}
+    const blob=await response.blob();
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement('a');link.href=url;
+    link.download='TamaGo-'+new Date().toISOString().slice(0,10)+'.tgsave';
+    document.body.append(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),30000);
+    say('存档已下载，请妥善保存');
+  }catch{say('导出失败，请检查设备连接',true)}
+  finally{button.disabled=false}
+};
+document.getElementById('save-import').onclick=async()=>{
+  const input=document.getElementById('save-file');const file=input.files&&input.files[0];
+  if(!file){say('请先选择 .tgsave 存档',true);return}
+  if(file.size<4124||file.size>8220){say('存档文件大小不符',true);return}
+  if(!confirm('导入将替换设备上的宠物存档。确认继续？'))return;
+  const button=document.getElementById('save-import');button.disabled=true;
+  try{
+    const response=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:file});
+    if(!response.ok){say(await response.text(),true);return}
+    say('存档已导入；点击“完成并启动游戏”查看宠物');
+  }catch{say('导入失败，请检查设备连接',true)}
+  finally{button.disabled=false}
+};
+for(let i=0;i<1;i++){
+  const card=document.createElement('section');card.className='item';
+  const head=document.createElement('div');head.className='head';
+  const name=document.createElement('span');name.className='name';name.textContent=(i===0?'主游戏':'配件 '+i)+' · '+names[i];
+  const state=document.createElement('span');state.className='state';state.textContent='未导入';
+  head.append(name,state);
+  const size=document.createElement('div');size.className='size';size.textContent='需要 '+(sizes[i]/1024).toFixed(1)+' KiB 的 .bin 文件';
+  const controls=document.createElement('div');controls.className='controls';
+  const input=document.createElement('input');input.type='file';input.accept='.bin,application/octet-stream';input.setAttribute('aria-label','选择 '+names[i]+' 文件');
+  const button=document.createElement('button');button.type='button';button.textContent='导入';
+  const bar=document.createElement('progress');bar.max=100;
+  controls.append(input,button);card.append(head,size,controls,bar);document.getElementById('slots').append(card);
+  cards.push({state,input,button,bar});
+  button.onclick=()=>{
+    if(uploadBusy)return;
+    const file=input.files&&input.files[0];
+    if(!file){say('请先选择文件',true);return}
+    if(file.size!==sizes[i]){say(names[i]+' 文件大小不符，应为 '+sizes[i]+' 字节',true);return}
+    setUploadBusy(true);bar.style.display='block';bar.value=0;state.textContent='传输中';say('正在导入 '+names[i]);
+    const xhr=new XMLHttpRequest();xhr.open('POST','/api/upload?id='+i);xhr.setRequestHeader('Content-Type','application/octet-stream');
+    xhr.upload.onprogress=e=>{if(e.lengthComputable)bar.value=Math.round(e.loaded/e.total*100)};
+    xhr.onload=()=>{setUploadBusy(false);bar.style.display='none';
+      if(xhr.status===200){state.textContent='已导入';state.className='state good';say(names[i]+' 导入成功')}
+      else{state.textContent='导入失败';state.className='state bad';say(xhr.responseText||'导入失败',true)}
+    };
+    xhr.onerror=()=>{setUploadBusy(false);bar.style.display='none';say(isUsb?'连接中断，请保持 USB 数据线连接后重试':'连接中断，请保持设备热点连接后重试',true)};
+    xhr.send(file);
+  };
+}
+document.getElementById('figure-upload').onclick=async()=>{
+  if(uploadBusy)return;
+  let entries;
+  try{entries=await selectedFigures()}
+  catch(error){say(error.message,true);return}
+  setUploadBusy(true);
+  const bar=document.getElementById('figure-progress');bar.style.display='block';bar.value=0;
+  try{
+    for(let index=0;index<entries.length;index++){
+      const {file,slot}=entries[index];say('正在导入 '+names[slot]);
+      await new Promise((resolve,reject)=>{
+        const xhr=new XMLHttpRequest();
+        xhr.open('POST','/api/upload?id='+slot);
+        xhr.setRequestHeader('Content-Type','application/octet-stream');
+        xhr.upload.onprogress=e=>{
+          if(e.lengthComputable)bar.value=Math.round((index+e.loaded/e.total)/entries.length*100);
+        };
+        xhr.onload=()=>xhr.status===200?resolve():reject(new Error(xhr.responseText||'导入失败'));
+        xhr.onerror=()=>reject(new Error('连接中断，请检查设备连接'));
+        xhr.send(file);
+      });
+      figureReady[slot-1]=true;renderFigures();bar.value=Math.round((index+1)/entries.length*100);
+    }
+    say('已导入 '+entries.map(e=>names[e.slot]).join('、'));
+  }catch(error){say(error.message,true)}
+  finally{bar.style.display='none';setUploadBusy(false)}
+};
+fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(data=>{
+  data.slots.forEach((ready,i)=>{
+    if(i===0&&ready){cards[0].state.textContent='已导入';cards[0].state.className='state good'}
+    if(i>0&&i<=12)figureReady[i-1]=!!ready;
+  });
+  renderFigures();
+}).catch(()=>say('暂时无法读取设备状态，请刷新页面',true));
+document.getElementById('finish').onclick=async()=>{
+  try{const r=await fetch('/api/finish',{method:'POST'});
+    if(!r.ok){say(await r.text(),true);return}
+    say('设备正在启动游戏，可以关闭此页面');document.getElementById('finish').disabled=true;
+  }catch{say('连接中断；请查看设备屏幕',true)}
+};
+</script>
+</body>
+</html>
